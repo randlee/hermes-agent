@@ -14137,13 +14137,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def inject_internal_message(
         self,
-        profile: str,
         platform: Platform,
         chat_id: str,
         text: str,
         notice_text: Optional[str] = None,
-        mode: str = "queue",
-    ) -> Optional[str]:
+        profile: str = "",
+    ) -> None:
         """Route an internal message through a platform adapter to the agent.
 
         Used by plugins (e.g., the ATM graft bridge) to inject synthetic
@@ -14196,22 +14195,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Resolve the adapter for the requested profile.
         adapter = None
         if profile:
-            if self._profile_adapters:
-                profile_map = self._profile_adapters.get(profile)
-                if profile_map is not None:
-                    adapter = profile_map.get(platform)
-                else:
-                    logger.warning(
-                        "inject_internal_message: profile %s not found, refusing fallback",
-                        profile,
-                    )
-                    return None
+            active = self._active_profile_name()
+            if profile == active:
+                adapter = self.adapters.get(platform)
+            elif self._profile_adapters and profile in self._profile_adapters:
+                adapter = self._profile_adapters[profile].get(platform)
             else:
                 logger.warning(
-                    "inject_internal_message: profile %s requested but _profile_adapters is empty",
+                    "inject_internal_message: unknown profile %s",
                     profile,
                 )
-                return None
+                return
         else:
             adapter = self.adapters.get(platform)
 
