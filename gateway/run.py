@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import Awaitable, Callable, Dict, Literal, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -14137,12 +14137,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def inject_internal_message(
         self,
+        *,
+        profile: str,
         platform: Platform,
         chat_id: str,
         text: str,
         notice_text: Optional[str] = None,
-        profile: str = "",
-        mode: str = "queue",
+        mode: Literal["queue", "steer"] = "queue",
     ) -> None:
         """Route an internal message through a platform adapter to the agent.
 
@@ -14153,8 +14154,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         guards.
 
         The adapter is selected from ``self._profile_adapters[profile]``
-        when ``profile`` names a secondary profile; otherwise
-        ``self.adapters`` (the running profile's map) is used.
+        when ``profile`` names a secondary profile, or from
+        ``self.adapters`` when ``profile`` matches the active profile.
+        Unknown profiles are rejected (fail closed).
 
         **Delivery modes** (``mode`` parameter):
 
@@ -14178,9 +14180,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
            enqueue) and does **not** spawn a background task.
 
         Args:
-            profile:     Profile name to route through (looked up in
-                         ``_profile_adapters``; falls back to
-                         ``self.adapters``).
+            profile:     Profile name to route through (required,
+                         keyword-only). Must be the active profile or a
+                         registered secondary profile — unknown profiles
+                         are rejected (fail closed).
             platform:    Platform enum (e.g. ``Platform.TELEGRAM``).
             chat_id:     Target chat ID for the platform.
             text:        Message text to inject.
@@ -14195,27 +14198,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # Resolve the adapter for the requested profile.
         adapter = None
-        if profile:
-            active = self._active_profile_name()
-            if profile == active:
-                adapter = self.adapters.get(platform)
-            elif self._profile_adapters and profile in self._profile_adapters:
-                adapter = self._profile_adapters[profile].get(platform)
-            else:
-                logger.warning(
-                    "inject_internal_message: unknown profile %s",
-                    profile,
-                )
-                return
-        else:
+        active = self._active_profile_name()
+        if profile == active:
             adapter = self.adapters.get(platform)
+        elif self._profile_adapters and profile in self._profile_adapters:
+            adapter = self._profile_adapters[profile].get(platform)
+        else:
+            logger.warning(
+                "inject_internal_message: unknown profile %s",
+                profile,
+            )
+            return
 
         if adapter is None:
             logger.warning(
                 "inject_internal_message: no adapter for profile=%s platform=%s",
                 profile, platform,
             )
-            return None
+            return
 
         # Optional visible notice (observability, not a duplicate message).
         if notice_text:

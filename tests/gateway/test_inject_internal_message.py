@@ -56,8 +56,13 @@ class _FakeRunningAgent:
         return self._steer_result
 
 
-def _make_runner(with_session_store=True):
-    """Build a bare GatewayRunner for unit testing the injection API."""
+def _make_runner(with_session_store=True, active_profile="test-profile"):
+    """Build a bare GatewayRunner for unit testing the injection API.
+
+    Args:
+        with_session_store: If True, attach a mock session_store.
+        active_profile: Value returned by ``_active_profile_name()``.
+    """
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
@@ -65,6 +70,8 @@ def _make_runner(with_session_store=True):
     tg = _FakeTelegramAdapter()
     runner.adapters = {Platform.TELEGRAM: tg}
     runner._profile_adapters = {}
+    # Mock _active_profile_name so tests don't depend on the host env
+    runner._active_profile_name = lambda: active_profile
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._session_run_generation = {}
@@ -101,9 +108,9 @@ def _make_runner(with_session_store=True):
 
 class TestInjectInternalMessage:
     """inject_internal_message routes an internal event to adapter.handle_message.
-    
-    Tests use profile="" (empty string) to bypass profile resolution
-    and fall through to self.adapters (the running profile's adapter map).
+
+    Tests use the active profile name (mock default: "test-profile")
+    to route through self.adapters — the running profile's adapter map.
     """
 
     @pytest.mark.asyncio
@@ -111,7 +118,7 @@ class TestInjectInternalMessage:
         """The event reaches handle_message on the correct adapter."""
         runner = _make_runner()
         await runner.inject_internal_message(
-            profile="",
+            profile="test-profile",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="ATM nudge test marker",
@@ -128,7 +135,7 @@ class TestInjectInternalMessage:
         """SessionSource reflects the real platform, not ATM."""
         runner = _make_runner()
         await runner.inject_internal_message(
-            profile="",
+            profile="test-profile",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="test",
@@ -145,7 +152,7 @@ class TestInjectInternalMessage:
         authorization and startup-restore guards."""
         runner = _make_runner()
         await runner.inject_internal_message(
-            profile="",
+            profile="test-profile",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="test",
@@ -174,7 +181,7 @@ class TestInjectInternalMessage:
         """notice_text is delivered via adapter.send before handle_message."""
         runner = _make_runner()
         await runner.inject_internal_message(
-            profile="",
+            profile="test-profile",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="nudge payload",
@@ -192,7 +199,7 @@ class TestInjectInternalMessage:
         runner = _make_runner()
         runner.adapters = {}  # no adapters at all
         result = await runner.inject_internal_message(
-            profile="",
+            profile="test-profile",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="test",
@@ -207,7 +214,7 @@ class TestInjectInternalMessage:
         tg.send = AsyncMock(side_effect=Exception("network down"))
 
         await runner.inject_internal_message(
-            profile="",
+            profile="test-profile",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="payload",
@@ -238,13 +245,13 @@ class TestInjectInternalMessage:
         assert len(default_tg.handled_events) == 0
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_default_adapters_with_empty_profile(self):
-        """When profile="" (empty), falls back to self.adapters."""
+    async def test_falls_back_to_default_adapters_with_active_profile(self):
+        """When profile matches the active profile, uses self.adapters."""
         runner = _make_runner()
         default_tg = runner.adapters[Platform.TELEGRAM]
 
         await runner.inject_internal_message(
-            profile="",
+            profile="test-profile",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="test",
