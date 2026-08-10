@@ -14142,6 +14142,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_id: str,
         text: str,
         notice_text: Optional[str] = None,
+        mode: str = "queue",
     ) -> Optional[str]:
         """Route an internal message through a platform adapter to the agent.
 
@@ -14155,26 +14156,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         when ``profile`` names a secondary profile; otherwise
         ``self.adapters`` (the running profile's map) is used.
 
+        **Delivery modes** (``mode`` parameter):
+
+        - ``"queue"`` (default): Fire-and-forget queuing through
+          ``adapter.handle_message()``. The message enters the normal
+          gateway dispatch path and is processed on the agent's next turn.
+          Safe for both idle and busy agents.
+
+        - ``"steer"``: Attempt to inject the text directly into the
+          **currently running** agent's turn via ``agent.steer()`` — the
+          message appears as part of the next tool result without
+          interrupting or restarting the loop. If no agent is currently
+          running for the session, falls back to ``"queue"`` mode.
+
         .. note::
 
-           This method is **fire-and-forget** — it awaits
+           ``"queue"`` mode is **fire-and-forget** — it awaits
            ``adapter.handle_message(event)`` which spawns a background
-           task and returns quickly. The agent response, if any, is
-           delivered through the normal gateway delivery path.
+           task and returns quickly. ``"steer"`` mode returns immediately
+           after calling ``agent.steer()`` (a synchronous, thread-safe
+           enqueue) and does **not** spawn a background task.
 
         Args:
-            profile:    Profile name to route through (looked up in
-                        ``_profile_adapters``; falls back to
-                        ``self.adapters``).
-            platform:   Platform enum (e.g. ``Platform.TELEGRAM``).
-            chat_id:    Target chat ID for the platform.
-            text:       Message text to inject.
+            profile:     Profile name to route through (looked up in
+                         ``_profile_adapters``; falls back to
+                         ``self.adapters``).
+            platform:    Platform enum (e.g. ``Platform.TELEGRAM``).
+            chat_id:     Target chat ID for the platform.
+            text:        Message text to inject.
             notice_text: Optional visible notice to send to the chat
                          before routing the event (observability surface).
+            mode:        Delivery mode: ``"queue"`` (default) or
+                         ``"steer"``.
 
         Returns:
-            ``None`` — the method returns after queuing the event for
-            dispatch.
+            ``None`` — the method returns after queuing or steering the
+            event.
         """
         # Resolve the adapter for the requested profile.
         adapter = None
@@ -14225,7 +14242,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=profile or None,
         )
 
-        # Queue mode (default): inject as internal MessageEvent.
+        # --- Steer mode: inject directly into running agent's turn ---
+        if mode == "steer":
+            # Resolve the session key for the source so we can look up
+            # whether an agent is currently running for this session.
+            try:
+                session_key = self._session_key_for_source(source)
+            except Exception:
+                session_key = None
+
+            if session_key:
+                running_state = self._running_agents.get(session_key)
+                if running_state is not None:
+                    running_agent = running_state[0] if isinstance(running_state, tuple) else None
+                    if (
+                        running_agent is not None
+                        and hasattr(running_agent, "steer")
+                    ):
+                        try:
+                            steered = running_agent.steer(text)
+                            if steered:
+                                logger.debug(
+                                    "inject_internal_message: steered into session %s",
+                                    session_key,
+                                )
+                                return None
+                        except Exception as exc:
+                            logger.warning(
+                                "inject_internal_message: steer failed for session %s: %s",
+                                session_key, exc,
+                            )
+                            # Fall through to queue mode below.
+
+        # --- Queue mode (default, or steer fallback) ---
+        # Construct MessageEvent with internal=True so the gateway skips
+        # authorization, startup-restore queueing, and scale-to-zero
+        # clocks — this is a host-originated event, not user traffic.
+        event = MessageEvent(
+            text=text,
+            source=source,
+            internal=True,
+        )
 
         # Route through the adapter's handle_message. This spawns a
         # background task that calls _handle_message → the full agent
