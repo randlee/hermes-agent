@@ -14142,6 +14142,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text: str,
         notice_text: Optional[str] = None,
         profile: str = "",
+        mode: str = "queue",
     ) -> None:
         """Route an internal message through a platform adapter to the agent.
 
@@ -14260,7 +14261,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "inject_internal_message: steered into session %s",
                                     session_key,
                                 )
-                                return None
+                                return
                         except Exception as exc:
                             logger.warning(
                                 "inject_internal_message: steer failed for session %s: %s",
@@ -14283,7 +14284,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # pipeline. We await so the caller knows the event was accepted
         # for dispatch; the response is delivered asynchronously.
         await adapter.handle_message(event)
-        return None
+        return
 
     def _make_adapter_auth_check(
         self,
