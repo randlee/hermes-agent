@@ -3,6 +3,7 @@
 Covers:
 - inject_internal_message: adapter selection, SessionSource routing,
   internal=True flag, notice_text delivery, missing-adapter failure
+- steer vs queue mode: steer into running agent, fallback to queue
 - No Platform.ATM creation (negative guarantee)
 - Runner exposed via gateway:startup hook payload
 """
@@ -41,6 +42,18 @@ class _FakeTelegramAdapter:
         self.handled_events.append(event)
         if self._message_handler:
             await self._message_handler(event)
+
+
+class _FakeRunningAgent:
+    """Minimal agent stub with a steer() method for steer-mode tests."""
+
+    def __init__(self, steer_result=True):
+        self._steer_result = steer_result
+        self.steered_texts: list[str] = []
+
+    def steer(self, text: str) -> bool:
+        self.steered_texts.append(text)
+        return self._steer_result
 
 
 def _make_runner(with_session_store=True):
@@ -83,18 +96,22 @@ def _make_runner(with_session_store=True):
 
 
 # ------------------------------------------------------------------
-# inject_internal_message
+# inject_internal_message — queue mode (default)
 # ------------------------------------------------------------------
 
 class TestInjectInternalMessage:
-    """inject_internal_message routes an internal event to adapter.handle_message."""
+    """inject_internal_message routes an internal event to adapter.handle_message.
+    
+    Tests use profile="" (empty string) to bypass profile resolution
+    and fall through to self.adapters (the running profile's adapter map).
+    """
 
     @pytest.mark.asyncio
     async def test_routes_through_telegram_adapter(self):
         """The event reaches handle_message on the correct adapter."""
         runner = _make_runner()
         await runner.inject_internal_message(
-            profile="skillrx",
+            profile="",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="ATM nudge test marker",
@@ -111,7 +128,7 @@ class TestInjectInternalMessage:
         """SessionSource reflects the real platform, not ATM."""
         runner = _make_runner()
         await runner.inject_internal_message(
-            profile="skillrx",
+            profile="",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="test",
@@ -128,7 +145,7 @@ class TestInjectInternalMessage:
         authorization and startup-restore guards."""
         runner = _make_runner()
         await runner.inject_internal_message(
-            profile="skillrx",
+            profile="",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="test",
@@ -140,29 +157,32 @@ class TestInjectInternalMessage:
     async def test_profile_passed_to_session_source(self):
         """The profile name is attached to SessionSource for session namespacing."""
         runner = _make_runner()
+        # Register profile adapter so the strict resolution works
+        skillrx_tg = _FakeTelegramAdapter()
+        runner._profile_adapters["skillrx"] = {Platform.TELEGRAM: skillrx_tg}
+        
         await runner.inject_internal_message(
             profile="skillrx",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="test",
         )
-        tg = runner.adapters[Platform.TELEGRAM]
-        assert tg.handled_events[0].source.profile == "skillrx"
+        assert skillrx_tg.handled_events[0].source.profile == "skillrx"
 
     @pytest.mark.asyncio
     async def test_sends_notice_text_before_routing(self):
         """notice_text is delivered via adapter.send before handle_message."""
         runner = _make_runner()
         await runner.inject_internal_message(
-            profile="skillrx",
+            profile="",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="nudge payload",
-            notice_text="⚡ ATM nudge received",
+            notice_text="\u26a1 ATM nudge received",
         )
         tg = runner.adapters[Platform.TELEGRAM]
         # Notice sent first
-        assert tg.sent_messages == [("100000001", "⚡ ATM nudge received")]
+        assert tg.sent_messages == [("100000001", "\u26a1 ATM nudge received")]
         # Then event routed
         assert tg.handled_events[0].text == "nudge payload"
 
@@ -172,7 +192,7 @@ class TestInjectInternalMessage:
         runner = _make_runner()
         runner.adapters = {}  # no adapters at all
         result = await runner.inject_internal_message(
-            profile="skillrx",
+            profile="",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="test",
@@ -187,7 +207,7 @@ class TestInjectInternalMessage:
         tg.send = AsyncMock(side_effect=Exception("network down"))
 
         await runner.inject_internal_message(
-            profile="skillrx",
+            profile="",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="payload",
@@ -218,20 +238,212 @@ class TestInjectInternalMessage:
         assert len(default_tg.handled_events) == 0
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_default_adapters_when_profile_not_found(self):
-        """When profile not in _profile_adapters, falls back to self.adapters."""
+    async def test_falls_back_to_default_adapters_with_empty_profile(self):
+        """When profile="" (empty), falls back to self.adapters."""
         runner = _make_runner()
-        # Don't register a separate profile adapter
-        runner._profile_adapters = {}
         default_tg = runner.adapters[Platform.TELEGRAM]
 
         await runner.inject_internal_message(
-            profile="skillrx",
+            profile="",
             platform=Platform.TELEGRAM,
             chat_id="100000001",
             text="test",
         )
         assert len(default_tg.handled_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_profile_not_found_returns_none(self):
+        """When profile is set but not in _profile_adapters, returns None."""
+        runner = _make_runner()
+        # Register a different profile to make _profile_adapters non-empty
+        runner._profile_adapters["other"] = {
+            Platform.TELEGRAM: _FakeTelegramAdapter()
+        }
+
+        result = await runner.inject_internal_message(
+            profile="nonexistent",
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            text="test",
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_empty_profile_adapters_with_profile_returns_none(self):
+        """When _profile_adapters is empty and profile is set, returns None."""
+        runner = _make_runner()
+        runner._profile_adapters = {}
+
+        result = await runner.inject_internal_message(
+            profile="skillrx",
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            text="test",
+        )
+        assert result is None
+
+
+# ------------------------------------------------------------------
+# inject_internal_message — steer mode
+# ------------------------------------------------------------------
+
+class TestInjectInternalMessageSteerMode:
+    """mode=\"steer\" injects text directly into the running agent's turn."""
+
+    @pytest.mark.asyncio
+    async def test_steers_into_running_agent(self):
+        """When an agent is running for the session, steer() is called
+        with the message text, and handle_message is NOT called."""
+        runner = _make_runner()
+        # Register profile adapter so strict resolution passes
+        skillrx_tg = _FakeTelegramAdapter()
+        runner._profile_adapters["skillrx"] = {Platform.TELEGRAM: skillrx_tg}
+        
+        agent = _FakeRunningAgent()
+        # Simulate a running agent by populating _running_agents with the
+        # session key that _session_key_for_source will produce.
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            chat_type="dm",
+            user_id="100000001",
+            profile="skillrx",
+        )
+        session_key = build_session_key(source)
+        runner._running_agents[session_key] = (agent,)
+
+        await runner.inject_internal_message(
+            profile="skillrx",
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            text="steered nudge",
+            mode="steer",
+        )
+
+        # Agent.steer() was called
+        assert agent.steered_texts == ["steered nudge"]
+        # handle_message was NOT called (no queue fallback)
+        assert len(skillrx_tg.handled_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_steer_falls_back_to_queue_when_no_agent_running(self):
+        """When no agent is running, steer mode falls back to queue."""
+        runner = _make_runner()
+        # Register profile adapter so strict resolution passes
+        skillrx_tg = _FakeTelegramAdapter()
+        runner._profile_adapters["skillrx"] = {Platform.TELEGRAM: skillrx_tg}
+        # _running_agents is empty — no agent running
+
+        await runner.inject_internal_message(
+            profile="skillrx",
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            text="fallback nudge",
+            mode="steer",
+        )
+
+        # Falls back to queue: handle_message was called
+        assert len(skillrx_tg.handled_events) == 1
+        event = skillrx_tg.handled_events[0]
+        assert event.text == "fallback nudge"
+        assert event.internal is True
+
+    @pytest.mark.asyncio
+    async def test_steer_falls_back_when_steer_returns_false(self):
+        """When steer() returns False, falls back to queue."""
+        runner = _make_runner()
+        skillrx_tg = _FakeTelegramAdapter()
+        runner._profile_adapters["skillrx"] = {Platform.TELEGRAM: skillrx_tg}
+        
+        agent = _FakeRunningAgent(steer_result=False)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            chat_type="dm",
+            user_id="100000001",
+            profile="skillrx",
+        )
+        session_key = build_session_key(source)
+        runner._running_agents[session_key] = (agent,)
+
+        await runner.inject_internal_message(
+            profile="skillrx",
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            text="empty steer",
+            mode="steer",
+        )
+
+        # steer() was called
+        assert agent.steered_texts == ["empty steer"]
+        # Falls back to queue
+        assert len(skillrx_tg.handled_events) == 1
+        assert skillrx_tg.handled_events[0].text == "empty steer"
+
+    @pytest.mark.asyncio
+    async def test_queue_mode_never_steers(self):
+        """Explicit mode=\"queue\" (or default) never calls steer(),
+        even when an agent is running."""
+        runner = _make_runner()
+        skillrx_tg = _FakeTelegramAdapter()
+        runner._profile_adapters["skillrx"] = {Platform.TELEGRAM: skillrx_tg}
+        
+        agent = _FakeRunningAgent()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            chat_type="dm",
+            user_id="100000001",
+            profile="skillrx",
+        )
+        session_key = build_session_key(source)
+        runner._running_agents[session_key] = (agent,)
+
+        await runner.inject_internal_message(
+            profile="skillrx",
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            text="queued nudge",
+            mode="queue",
+        )
+
+        # steer() was NOT called
+        assert agent.steered_texts == []
+        # handle_message WAS called (queue path)
+        assert len(skillrx_tg.handled_events) == 1
+        assert skillrx_tg.handled_events[0].text == "queued nudge"
+
+    @pytest.mark.asyncio
+    async def test_steer_mode_preserves_notice_text(self):
+        """notice_text is still sent even in steer mode."""
+        runner = _make_runner()
+        skillrx_tg = _FakeTelegramAdapter()
+        runner._profile_adapters["skillrx"] = {Platform.TELEGRAM: skillrx_tg}
+        
+        agent = _FakeRunningAgent()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            chat_type="dm",
+            user_id="100000001",
+            profile="skillrx",
+        )
+        session_key = build_session_key(source)
+        runner._running_agents[session_key] = (agent,)
+
+        await runner.inject_internal_message(
+            profile="skillrx",
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            text="steered payload",
+            notice_text="📬 ATM nudge",
+            mode="steer",
+        )
+
+        # Notice was sent
+        assert skillrx_tg.sent_messages == [("100000001", "📬 ATM nudge")]
+        # Text was steered
+        assert agent.steered_texts == ["steered payload"]
 
 
 # ------------------------------------------------------------------
