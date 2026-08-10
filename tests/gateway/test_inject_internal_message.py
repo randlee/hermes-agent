@@ -15,7 +15,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, InjectInternalMessageError
 from gateway.session import SessionSource, build_session_key
 
 
@@ -194,17 +194,17 @@ class TestInjectInternalMessage:
         assert tg.handled_events[0].text == "nudge payload"
 
     @pytest.mark.asyncio
-    async def test_missing_adapter_returns_none(self):
-        """Returns None gracefully when no adapter exists for the platform."""
+    async def test_missing_adapter_raises(self):
+        """Raises InjectInternalMessageError when no adapter for platform."""
         runner = _make_runner()
-        runner.adapters = {}  # no adapters at all
-        result = await runner.inject_internal_message(
-            profile="test-profile",
-            platform=Platform.TELEGRAM,
-            chat_id="100000001",
-            text="test",
-        )
-        assert result is None
+        runner.adapters = {}  # no adapters for any platform
+        with pytest.raises(InjectInternalMessageError) as exc:
+            await runner.inject_internal_message(
+                platform=Platform.TELEGRAM,
+                chat_id="100000001",
+                text="test",
+            )
+        assert exc.value.code == "adapter_not_found"
 
     @pytest.mark.asyncio
     async def test_notice_failure_does_not_prevent_routing(self):
@@ -259,35 +259,36 @@ class TestInjectInternalMessage:
         assert len(default_tg.handled_events) == 1
 
     @pytest.mark.asyncio
-    async def test_profile_not_found_returns_none(self):
-        """When profile is set but not in _profile_adapters, returns None."""
+    async def test_unknown_profile_raises(self):
+        """Raises InjectInternalMessageError when profile not found."""
         runner = _make_runner()
-        # Register a different profile to make _profile_adapters non-empty
         runner._profile_adapters["other"] = {
             Platform.TELEGRAM: _FakeTelegramAdapter()
         }
 
-        result = await runner.inject_internal_message(
-            profile="nonexistent",
-            platform=Platform.TELEGRAM,
-            chat_id="100000001",
-            text="test",
-        )
-        assert result is None
+        with pytest.raises(InjectInternalMessageError) as exc:
+            await runner.inject_internal_message(
+                profile="nonexistent",
+                platform=Platform.TELEGRAM,
+                chat_id="100000001",
+                text="test",
+            )
+        assert exc.value.code == "unknown_profile"
 
     @pytest.mark.asyncio
-    async def test_empty_profile_adapters_with_profile_returns_none(self):
-        """When _profile_adapters is empty and profile is set, returns None."""
+    async def test_empty_profile_adapters_raises(self):
+        """Raises InjectInternalMessageError when _profile_adapters empty."""
         runner = _make_runner()
         runner._profile_adapters = {}
 
-        result = await runner.inject_internal_message(
-            profile="skillrx",
-            platform=Platform.TELEGRAM,
-            chat_id="100000001",
-            text="test",
-        )
-        assert result is None
+        with pytest.raises(InjectInternalMessageError) as exc:
+            await runner.inject_internal_message(
+                profile="skillrx",
+                platform=Platform.TELEGRAM,
+                chat_id="100000001",
+                text="test",
+            )
+        assert exc.value.code == "profile_map_empty"
 
 
 # ------------------------------------------------------------------
@@ -470,6 +471,88 @@ def test_no_atm_platform_created():
     assert "atm" not in {p.value for p in runner._profile_adapters.values()}
 
 
+
+
+# ------------------------------------------------------------------
+# Isolation tests — queue and steer must not cross sessions
+# ------------------------------------------------------------------
+
+class TestInjectInternalMessageIsolation:
+    """Both queue and steer modes must be scoped to their target session."""
+
+    @pytest.mark.asyncio
+    async def test_queue_isolation_different_chat_id_only_routes_to_target(self):
+        """Queue mode targeting chat A does not deliver to chat B's adapter."""
+        runner = _make_runner()
+        tg_a = runner.adapters[Platform.TELEGRAM]
+        # Create a separate adapter for chat B
+        tg_b = _FakeTelegramAdapter()
+        runner._profile_adapters["chatB"] = {Platform.TELEGRAM: tg_b}
+
+        # Inject into chat B's profile adapter
+        await runner.inject_internal_message(
+            profile="chatB",
+            platform=Platform.TELEGRAM,
+            chat_id="chatB-id",
+            text="only for B",
+            mode="queue",
+        )
+
+        # Chat B received it
+        assert len(tg_b.handled_events) == 1
+        assert tg_b.handled_events[0].text == "only for B"
+        # Chat A did NOT receive it
+        assert len(tg_a.handled_events) == 0
+
+    @pytest.mark.asyncio
+    async def test_steer_isolation_different_chat_id_does_not_cross(self):
+        """Steer mode targeting chat A's running agent does not affect chat B."""
+        runner = _make_runner()
+        tg_a = runner.adapters[Platform.TELEGRAM]
+        tg_b = _FakeTelegramAdapter()
+        runner._profile_adapters["chatB"] = {Platform.TELEGRAM: tg_b}
+
+        # Running agent only for chat A
+        agent_a = _FakeRunningAgent()
+        source_a = SessionSource(
+            platform=Platform.TELEGRAM, chat_id="chatA-id",
+            chat_type="dm", user_id="chatA-id", profile="test-profile",
+        )
+        runner._running_agents[build_session_key(source_a)] = (agent_a,)
+
+        # Steer into chat B's profile
+        await runner.inject_internal_message(
+            profile="chatB",
+            platform=Platform.TELEGRAM,
+            chat_id="chatB-id",
+            text="steer to B",
+            mode="steer",
+        )
+
+        # Agent A was NOT steered
+        assert agent_a.steered_texts == []
+        # Chat B received via queue fallback (no agent running for B)
+        assert len(tg_b.handled_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_active_profile_isolation_self_adapters_only(self):
+        """Active profile routes through self.adapters, not secondary profiles."""
+        runner = _make_runner(active_profile="primary")
+        tg_primary = runner.adapters[Platform.TELEGRAM]
+        tg_secondary = _FakeTelegramAdapter()
+        runner._profile_adapters["secondary"] = {Platform.TELEGRAM: tg_secondary}
+
+        await runner.inject_internal_message(
+            profile="primary",
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            text="primary only",
+        )
+
+        # Only primary adapter was used
+        assert len(tg_primary.handled_events) == 1
+        assert len(tg_secondary.handled_events) == 0
+
 # ------------------------------------------------------------------
 # Runner in gateway:startup hook payload
 # ------------------------------------------------------------------
@@ -486,7 +569,7 @@ class TestGatewayStartupHook:
         runner.hooks.loaded_hooks = []
         await runner.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in runner.adapters.keys()],
-            "runner": runner,
+            "gateway_runner": runner,
         })
 
         runner.hooks.emit.assert_called_once()

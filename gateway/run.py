@@ -5857,6 +5857,17 @@ class TurnRunner:
 
 
 
+
+class InjectInternalMessageError(ValueError):
+    """Structured error raised when inject_internal_message cannot deliver."""
+
+    def __init__(self, code: str, chat_id: str, detail: str) -> None:
+        self.code = code
+        self.chat_id = chat_id
+        self.detail = detail
+        super().__init__(f'[{code}] chat={chat_id}: {detail}')
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
