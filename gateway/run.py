@@ -14178,11 +14178,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # Resolve the adapter for the requested profile.
         adapter = None
-        if profile and self._profile_adapters:
-            profile_map = self._profile_adapters.get(profile)
-            if profile_map:
-                adapter = profile_map.get(platform)
-        if adapter is None:
+        if profile:
+            if self._profile_adapters:
+                profile_map = self._profile_adapters.get(profile)
+                if profile_map is not None:
+                    adapter = profile_map.get(platform)
+                else:
+                    logger.warning(
+                        "inject_internal_message: profile %s not found, refusing fallback",
+                        profile,
+                    )
+                    return None
+            else:
+                logger.warning(
+                    "inject_internal_message: profile %s requested but _profile_adapters is empty",
+                    profile,
+                )
+                return None
+        else:
             adapter = self.adapters.get(platform)
 
         if adapter is None:
@@ -14191,25 +14204,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 profile, platform,
             )
             return None
-
-        # Construct SessionSource — deliberately NOT a synthetic Telegram
-        # user message; the platform and chat_id reflect the real delivery
-        # channel so session resolution keys on the right identity.
-        source = SessionSource(
-            platform=platform,
-            chat_id=chat_id,
-            chat_type="dm",
-            profile=profile or None,
-        )
-
-        # Construct MessageEvent with internal=True so the gateway skips
-        # authorization, startup-restore queueing, and scale-to-zero
-        # clocks — this is a host-originated event, not user traffic.
-        event = MessageEvent(
-            text=text,
-            source=source,
-            internal=True,
-        )
 
         # Optional visible notice (observability, not a duplicate message).
         if notice_text:
@@ -14220,6 +14214,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "inject_internal_message: failed to send notice to %s: %s",
                     chat_id, exc,
                 )
+
+        # Construct SessionSource with user_id=chat_id so session
+        # resolution keys on the real Telegram session identity.
+        source = SessionSource(
+            platform=platform,
+            chat_id=chat_id,
+            chat_type="dm",
+            user_id=chat_id,
+            profile=profile or None,
+        )
+
+        # Queue mode (default): inject as internal MessageEvent.
 
         # Route through the adapter's handle_message. This spawns a
         # background task that calls _handle_message → the full agent
