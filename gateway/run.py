@@ -14131,6 +14131,103 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return None
 
+    # ------------------------------------------------------------------
+    # Public injection API — exposed to plugins via gateway:startup hook
+    # ------------------------------------------------------------------
+
+    async def inject_internal_message(
+        self,
+        profile: str,
+        platform: Platform,
+        chat_id: str,
+        text: str,
+        notice_text: Optional[str] = None,
+    ) -> Optional[str]:
+        """Route an internal message through a platform adapter to the agent.
+
+        Used by plugins (e.g., the ATM graft bridge) to inject synthetic
+        host-originated messages that enter the agent loop via the normal
+        adapter→gateway dispatch path, but with ``internal=True`` so they
+        bypass user authorization, startup restore, and other user-facing
+        guards.
+
+        The adapter is selected from ``self._profile_adapters[profile]``
+        when ``profile`` names a secondary profile; otherwise
+        ``self.adapters`` (the running profile's map) is used.
+
+        .. note::
+
+           This method is **fire-and-forget** — it awaits
+           ``adapter.handle_message(event)`` which spawns a background
+           task and returns quickly. The agent response, if any, is
+           delivered through the normal gateway delivery path.
+
+        Args:
+            profile:    Profile name to route through (looked up in
+                        ``_profile_adapters``; falls back to
+                        ``self.adapters``).
+            platform:   Platform enum (e.g. ``Platform.TELEGRAM``).
+            chat_id:    Target chat ID for the platform.
+            text:       Message text to inject.
+            notice_text: Optional visible notice to send to the chat
+                         before routing the event (observability surface).
+
+        Returns:
+            ``None`` — the method returns after queuing the event for
+            dispatch.
+        """
+        # Resolve the adapter for the requested profile.
+        adapter = None
+        if profile and self._profile_adapters:
+            profile_map = self._profile_adapters.get(profile)
+            if profile_map:
+                adapter = profile_map.get(platform)
+        if adapter is None:
+            adapter = self.adapters.get(platform)
+
+        if adapter is None:
+            logger.warning(
+                "inject_internal_message: no adapter for profile=%s platform=%s",
+                profile, platform,
+            )
+            return None
+
+        # Construct SessionSource — deliberately NOT a synthetic Telegram
+        # user message; the platform and chat_id reflect the real delivery
+        # channel so session resolution keys on the right identity.
+        source = SessionSource(
+            platform=platform,
+            chat_id=chat_id,
+            chat_type="dm",
+            profile=profile or None,
+        )
+
+        # Construct MessageEvent with internal=True so the gateway skips
+        # authorization, startup-restore queueing, and scale-to-zero
+        # clocks — this is a host-originated event, not user traffic.
+        event = MessageEvent(
+            text=text,
+            source=source,
+            internal=True,
+        )
+
+        # Optional visible notice (observability, not a duplicate message).
+        if notice_text:
+            try:
+                await adapter.send(chat_id, notice_text)
+            except Exception as exc:
+                logger.warning(
+                    "inject_internal_message: failed to send notice to %s: %s",
+                    chat_id, exc,
+                )
+
+        # Route through the adapter's handle_message. This spawns a
+        # background task that calls _handle_message → the full agent
+        # pipeline. We await so the caller knows the event was accepted
+        # for dispatch; the response is delivered asynchronously.
+        await adapter.handle_message(event)
+        return None
+
     def _make_adapter_auth_check(
         self,
         platform: Platform,
