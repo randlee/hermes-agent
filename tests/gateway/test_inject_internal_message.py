@@ -200,6 +200,7 @@ class TestInjectInternalMessage:
         runner.adapters = {}  # no adapters for any platform
         with pytest.raises(InjectInternalMessageError) as exc:
             await runner.inject_internal_message(
+                profile="test-profile",
                 platform=Platform.TELEGRAM,
                 chat_id="100000001",
                 text="test",

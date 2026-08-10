@@ -14215,19 +14215,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = self.adapters.get(platform)
         elif self._profile_adapters and profile in self._profile_adapters:
             adapter = self._profile_adapters[profile].get(platform)
-        else:
-            logger.warning(
-                "inject_internal_message: unknown profile %s",
-                profile,
+        elif not self._profile_adapters:
+            raise InjectInternalMessageError(
+                code='profile_map_empty',
+                chat_id=chat_id,
+                detail=f'No profile adapters registered (profile={profile})',
             )
-            return
+        else:
+            raise InjectInternalMessageError(
+                code='unknown_profile',
+                chat_id=chat_id,
+                detail=f'Unknown profile: {profile}',
+            )
 
         if adapter is None:
-            logger.warning(
-                "inject_internal_message: no adapter for profile=%s platform=%s",
-                profile, platform,
+            raise InjectInternalMessageError(
+                code='adapter_not_found',
+                chat_id=chat_id,
+                detail=f'No adapter for profile={profile} platform={platform}',
             )
-            return
 
         # Optional visible notice (observability, not a duplicate message).
         if notice_text:
