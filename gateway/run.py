@@ -14208,6 +14208,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ``None`` — the method returns after queuing or steering the
             event.
         """
+        # --- Mode validation (fail-closed for unknown modes) ---
+        _VALID_MODES = {"queue", "steer"}
+        if mode not in _VALID_MODES:
+            raise InjectInternalMessageError(
+                code='invalid_mode',
+                chat_id=chat_id,
+                detail=(
+                    f'Invalid mode: {mode!r}. '
+                    f'Must be one of: {", ".join(sorted(_VALID_MODES))}'
+                ),
+            )
+
         # Resolve the adapter for the requested profile.
         adapter = None
         active = self._active_profile_name()

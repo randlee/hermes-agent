@@ -554,6 +554,131 @@ class TestInjectInternalMessageIsolation:
         assert len(tg_primary.handled_events) == 1
         assert len(tg_secondary.handled_events) == 0
 
+    # ------------------------------------------------------------------
+    # Host-contract isolation tests (AL17 gate)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_steer_isolation_same_profile_different_chats(self):
+        """same-profile/two-chat steer isolation: steer to chat B must not
+        affect chat A's running agent, and vice versa."""
+        runner = _make_runner(active_profile="test-profile")
+        tg = runner.adapters[Platform.TELEGRAM]
+
+        # Chat A has a running agent, chat B does not.
+        agent_a = _FakeRunningAgent()
+        source_a = SessionSource(
+            platform=Platform.TELEGRAM, chat_id="chatA-id",
+            chat_type="dm", user_id="chatA-id", profile="test-profile",
+        )
+        runner._running_agents[build_session_key(source_a)] = (agent_a,)
+
+        # Steer into chat B — must NOT affect chat A's agent
+        await runner.inject_internal_message(
+            profile="test-profile",
+            platform=Platform.TELEGRAM,
+            chat_id="chatB-id",
+            text="steer to B",
+            mode="steer",
+        )
+
+        # Agent A was NOT steered
+        assert agent_a.steered_texts == []
+        # Chat B received via queue fallback (no agent running for B)
+        assert len(tg.handled_events) == 1
+        assert tg.handled_events[0].text == "steer to B"
+
+        # Now reverse: clear events, run agent for B, steer to A
+        tg.handled_events.clear()
+        agent_b = _FakeRunningAgent()
+        source_b = SessionSource(
+            platform=Platform.TELEGRAM, chat_id="chatB-id",
+            chat_type="dm", user_id="chatB-id", profile="test-profile",
+        )
+        runner._running_agents[build_session_key(source_b)] = (agent_b,)
+        # Remove agent A so it can't interfere
+        del runner._running_agents[build_session_key(source_a)]
+
+        await runner.inject_internal_message(
+            profile="test-profile",
+            platform=Platform.TELEGRAM,
+            chat_id="chatA-id",
+            text="steer to A",
+            mode="steer",
+        )
+
+        # Agent B was NOT steered
+        assert agent_b.steered_texts == []
+        # Chat A received via queue fallback
+        assert len(tg.handled_events) == 1
+        assert tg.handled_events[0].text == "steer to A"
+
+    @pytest.mark.asyncio
+    async def test_steer_isolation_different_profiles_same_chat(self):
+        """two-profiles/same-chat isolation: steer to profile B with the
+        same chat_id must not affect profile A's running agent."""
+        runner = _make_runner(active_profile="test-profile")
+        # Use profile-aware session key generation so different profiles
+        # produce different session keys (as in production with
+        # multiplex_profiles=True).
+        runner.session_store._generate_session_key = (
+            lambda src: build_session_key(src, profile=src.profile)
+        )
+
+        # Profile A has a running agent for chat_id "100000001"
+        tg_a = _FakeTelegramAdapter()
+        runner._profile_adapters["profileA"] = {Platform.TELEGRAM: tg_a}
+        agent_a = _FakeRunningAgent()
+        source_a = SessionSource(
+            platform=Platform.TELEGRAM, chat_id="100000001",
+            chat_type="dm", user_id="100000001", profile="profileA",
+        )
+        runner._running_agents[
+            build_session_key(source_a, profile="profileA")
+        ] = (agent_a,)
+
+        # Profile B has its own adapter, no running agent
+        tg_b = _FakeTelegramAdapter()
+        runner._profile_adapters["profileB"] = {Platform.TELEGRAM: tg_b}
+
+        # Steer into profile B with same chat_id
+        await runner.inject_internal_message(
+            profile="profileB",
+            platform=Platform.TELEGRAM,
+            chat_id="100000001",
+            text="steer to B",
+            mode="steer",
+        )
+
+        # Profile A's agent was NOT steered
+        assert agent_a.steered_texts == []
+        # Profile A received nothing
+        assert len(tg_a.handled_events) == 0
+        # Profile B received via queue fallback
+        assert len(tg_b.handled_events) == 1
+        assert tg_b.handled_events[0].text == "steer to B"
+
+    @pytest.mark.asyncio
+    async def test_invalid_mode_fails_closed(self):
+        """invalid runtime mode must raise InjectInternalMessageError rather
+        than silently falling through to queue mode."""
+        runner = _make_runner()
+
+        invalid_modes = ["invalid", "blerg", "INVALID", "", "steer "]
+        for bad_mode in invalid_modes:
+            with pytest.raises(InjectInternalMessageError) as exc:
+                await runner.inject_internal_message(
+                    profile="test-profile",
+                    platform=Platform.TELEGRAM,
+                    chat_id="100000001",
+                    text="test",
+                    mode=bad_mode,
+                )
+            assert exc.value.code == "invalid_mode", (
+                f"mode={bad_mode!r} got code={exc.value.code!r}, "
+                f"expected 'invalid_mode'"
+            )
+
 # ------------------------------------------------------------------
 # Runner in gateway:startup hook payload
 # ------------------------------------------------------------------
