@@ -230,6 +230,26 @@ class TestInjectInternalMessage:
         assert tg.handled_events[0].text == "payload"
 
     @pytest.mark.asyncio
+    async def test_reported_notice_failure_does_not_prevent_routing(self, caplog):
+        """A failed SendResult is observable but cannot suppress the XML event."""
+        runner = _make_runner()
+        tg = runner.adapters[Platform.TELEGRAM]
+        tg.send = AsyncMock(return_value=MagicMock(success=False, error="network down"))
+
+        with caplog.at_level("WARNING"):
+            await runner.inject_internal_message(
+                profile="test-profile",
+                platform=Platform.TELEGRAM,
+                chat_id="100000001",
+                text="payload",
+                notice_text="notice that fails",
+            )
+
+        assert len(tg.handled_events) == 1
+        assert tg.handled_events[0].text == "payload"
+        assert "visible notice was not delivered: network down" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_selects_adapter_from_profile_adapters(self):
         """When a profile is in _profile_adapters, its adapter is used."""
         runner = _make_runner()
