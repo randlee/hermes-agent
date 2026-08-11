@@ -14250,11 +14250,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Optional visible notice (observability, not a duplicate message).
         if notice_text:
             try:
-                await adapter.send(chat_id, notice_text)
+                notice_result = await adapter.send(
+                    chat_id,
+                    notice_text,
+                    metadata={"notify": True},
+                )
+                if not getattr(notice_result, "success", False):
+                    logger.warning(
+                        "inject_internal_message: visible notice was not delivered: %s",
+                        getattr(notice_result, "error", "unknown adapter failure"),
+                    )
             except Exception as exc:
                 logger.warning(
-                    "inject_internal_message: failed to send notice to %s: %s",
-                    chat_id, exc,
+                    "inject_internal_message: visible notice send raised: %s",
+                    exc,
                 )
 
         # Construct SessionSource with user_id=chat_id so session
