@@ -32,11 +32,14 @@ class _FakeTelegramAdapter:
 
     def __init__(self):
         self.sent_messages: list = []          # (chat_id, text) tuples
+        self.send_kwargs: list[dict] = []
         self.handled_events: list[MessageEvent] = []
         self._message_handler = AsyncMock()
 
     async def send(self, chat_id, text, **kwargs):
         self.sent_messages.append((chat_id, text))
+        self.send_kwargs.append(kwargs)
+        return MagicMock(success=True, error=None)
 
     async def handle_message(self, event):
         self.handled_events.append(event)
@@ -190,6 +193,7 @@ class TestInjectInternalMessage:
         tg = runner.adapters[Platform.TELEGRAM]
         # Notice sent first
         assert tg.sent_messages == [("100000001", "\u26a1 ATM nudge received")]
+        assert tg.send_kwargs == [{"metadata": {"notify": True}}]
         # Then event routed
         assert tg.handled_events[0].text == "nudge payload"
 
