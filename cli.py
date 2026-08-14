@@ -1651,10 +1651,18 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
     else:
         base_ref, base_label = "HEAD", "HEAD (local — worktree_sync disabled)"
 
-    # Create the worktree
+    # Create the worktree. checkout.workers parallelizes the file
+    # materialization (~6k files on this repo): 0.6s serial → ~0.2s with 8
+    # workers. Harmless on git builds without parallel-checkout support —
+    # unknown -c keys are ignored for checkout, and the fallback retry
+    # below drops the flags entirely.
+    _wt_add_cfg = [
+        "-c", "checkout.workers=8",
+        "-c", "checkout.thresholdForParallelism=100",
+    ]
     try:
         result = subprocess.run(
-            ["git", "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
+            ["git", *_wt_add_cfg, "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=repo_root,
         )
         if result.returncode != 0:
@@ -2679,6 +2687,63 @@ def _query_osc11_background() -> str | None:
                     break
         except Exception:
             pass
+
+
+def _heal_cooked_mode_drift(fd: int) -> bool:
+    """Detect and heal cooked-mode termios drift on *fd* while prompt_toolkit
+    expects raw mode.
+
+    prompt_toolkit's ``run_in_terminal`` / ``in_terminal`` wraps every
+    "print above the prompt" in a ``cooked_mode()`` context: it flips the
+    tty back to cooked (ICANON/ECHO/ISIG), runs the function, then restores
+    raw mode.  Hermes schedules those windows cross-thread constantly — the
+    background self-review's ``💾`` summary, background process notification
+    drains, curses pickers — and if a restore is ever lost (coroutine
+    cancelled mid-window, racing chains, an external writer touching the
+    shared tty), the terminal is left in cooked mode while the Application
+    still believes it owns raw mode.  The kernel line-buffers every
+    keystroke and the CLI appears to "stop taking input" even though the
+    process is perfectly healthy (observed live: pts in ``icanon echo``
+    while the event loop idled normally in ``ep_poll``).
+
+    This helper is the last line of defense for that whole class: when the
+    lflag has drifted back to cooked, re-apply prompt_toolkit's own raw-mode
+    flag surgery (mirrors ``prompt_toolkit.input.vt100.raw_mode``) in place.
+    Returns True when drift was detected and healed, False when the tty was
+    already raw (or could not be inspected).
+
+    POSIX-only by construction — callers must not invoke this on Windows
+    (no termios; prompt_toolkit uses the win32 console API there instead).
+    """
+    try:
+        import termios
+        attrs = termios.tcgetattr(fd)
+    except Exception:
+        return False
+    lflag = attrs[3]
+    if not (lflag & (termios.ICANON | termios.ECHO)):
+        return False  # still raw — nothing to do
+    # Same surgery as prompt_toolkit.input.vt100.raw_mode._patch_lflag /
+    # _patch_iflag, applied to the *current* attrs so any user settings
+    # (speed, size-independent flags) are preserved.
+    attrs[3] = lflag & ~(
+        termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG
+    )
+    attrs[0] = attrs[0] & ~(
+        termios.IXON
+        | termios.IXOFF
+        | termios.ICRNL
+        | termios.INLCR
+        | termios.IGNCR
+    )
+    # VMIN=1 so reads return per-byte (Solaris-derived systems default to 4;
+    # prompt_toolkit sets this explicitly in raw_mode.__enter__).
+    attrs[6][termios.VMIN] = 1
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception:
+        return False
+    return True
 
 
 def _detect_light_mode() -> bool:
@@ -4413,6 +4478,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._pending_edit_snapshots = {}
         self._last_input_mode_recovery = 0.0
         self._input_mode_recovery_notice_shown = False
+        self._last_termios_drift_check = 0.0
+        self._termios_drift_notice_shown = False
         
         # Configuration - priority: CLI args > env vars > config file
         # Model comes from: CLI arg or config.yaml (single source of truth).
@@ -4422,6 +4489,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _model_config = CLI_CONFIG.get("model", {})
         _config_model = (_model_config.get("default") or _model_config.get("model") or "") if isinstance(_model_config, dict) else (_model_config or "")
         _DEFAULT_CONFIG_MODEL = ""
+        # Track whether the user passed -m / --model so resume knows not to
+        # clobber an explicit override with the session's stored model.
+        self._explicit_model_override = bool(model)
         self.model = model or _config_model or _DEFAULT_CONFIG_MODEL
         # A ``moa:<preset>`` model string selects the MoA virtual provider in
         # one shot (parity with interactive ``/moa`` and the model picker). Do
@@ -4770,6 +4840,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._prompt_stash = _PromptStash()
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
+        # Background --skills preload (started by cmd_chat; joined by
+        # finalize_preloaded_skills before any agent is built).
+        self._preload_skills_thread: Optional[threading.Thread] = None
+        self._preload_skills_result: Optional[tuple] = None
+        self._preload_skills_error: Optional[BaseException] = None
+        self._preload_skills_requested: list = []
+        self._preload_skills_finalized = False
         self._active_session_lease = None
 
         # Voice mode state (also reinitialized inside run() for interactive TUI).
@@ -7343,6 +7420,72 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # logged at DEBUG by the advisory module.
             pass
 
+    def _show_browser_backend_notice(self):
+        """One-time hint when the default Browser Use backend isn't runnable.
+
+        Browser Use mode is the default browser backend, but it silently
+        falls back to the built-in browser tools when neither the
+        browser-use CLI nor uvx can be found. Surface that downgrade once
+        per 24h so users know why browsing behaves differently and how to
+        fix it (rate limiting lives in default_downgrade_notice()).
+        """
+        try:
+            from tools.browser_use_cli import default_downgrade_notice
+
+            notice = default_downgrade_notice()
+            if notice:
+                self._console_print(f"[yellow]⚠ {notice}[/yellow]")
+        except Exception:
+            # Never let a hint block startup.
+            logger.debug("browser backend notice failed", exc_info=True)
+
+    def finalize_preloaded_skills(self) -> None:
+        """Join the background --skills preload and fold it into the prompt.
+
+        Idempotent; no-op when no preload was requested. Called from
+        ``_init_agent`` (before the agent snapshots ``self.system_prompt``)
+        and safe to call from any other consumer of the system prompt.
+        Raises ``ValueError`` when EVERY requested skill was unknown —
+        the same contract the old synchronous path enforced in cmd_chat.
+        """
+        if getattr(self, "_preload_skills_finalized", False):
+            return
+        thread = getattr(self, "_preload_skills_thread", None)
+        if thread is None:
+            self._preload_skills_finalized = True
+            return
+        thread.join(timeout=120)
+        self._preload_skills_finalized = True
+        err = getattr(self, "_preload_skills_error", None)
+        if err is not None:
+            raise err
+        result = getattr(self, "_preload_skills_result", None)
+        if not result:
+            return
+        skills_prompt, loaded_skills, missing_skills = result
+        if missing_skills:
+            missing_display = ", ".join(missing_skills)
+            # If at least one skill loaded, degrade gracefully: skip the
+            # unknown ones and continue. A typo'd skill name should not crash
+            # the worker (which auto-blocks the Kanban task after retries).
+            # Only when EVERY requested skill is missing do we hard-fail, so a
+            # fully-misconfigured worker fails loudly instead of running blind.
+            if loaded_skills:
+                logger.warning(
+                    "Unknown skill(s) requested, skipping: %s. "
+                    "Continuing with: %s. "
+                    "List available skills with `hermes skills list`.",
+                    missing_display,
+                    ", ".join(loaded_skills),
+                )
+            else:
+                raise ValueError(f"Unknown skill(s): {missing_display}")
+        if skills_prompt:
+            self.system_prompt = "\n\n".join(
+                part for part in (self.system_prompt, skills_prompt) if part
+            ).strip()
+            self.preloaded_skills = loaded_skills
+
     def show_banner(self):
         """Display the welcome banner in Claude Code style."""
         self.console.clear()
@@ -7359,28 +7502,115 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._console_print(_build_compact_banner())
             self._show_status()
         else:
-            # Get tools for display
-            tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
-            
+            # Warm-launch fast path: replay last launch's tool panel when the
+            # snapshot fingerprint (config.yaml + .env + checkout rev +
+            # toolsets) is unchanged, skipping the ~0.5-0.9s cold
+            # get_tool_definitions walk. The agent's REAL tool list is still
+            # computed fresh at first message; a background refresh below
+            # re-verifies the snapshot so any drift self-heals next launch.
+            from hermes_cli.banner import (
+                compute_toolset_availability,
+                load_banner_snapshot,
+                save_banner_snapshot,
+            )
+
+            snapshot = None
+            try:
+                snapshot = load_banner_snapshot(self.enabled_toolsets)
+            except Exception:
+                snapshot = None
+
             # Get terminal working directory (where commands will execute)
             cwd = os.getenv("TERMINAL_CWD", os.getcwd())
-            
-            # Build and display the banner
-            build_welcome_banner(
-                console=self.console,
-                model=self.model,
-                cwd=cwd,
-                tools=tools,
-                enabled_toolsets=self.enabled_toolsets,
-                session_id=self.session_id,
-                context_length=ctx_len,
-                provider=self.provider,
-            )
+
+            if snapshot is not None:
+                self._defer_tool_warnings = True
+                toolset_map = snapshot["toolset_map"]
+                build_welcome_banner(
+                    console=self.console,
+                    model=self.model,
+                    cwd=cwd,
+                    tools=snapshot["tools"],
+                    enabled_toolsets=self.enabled_toolsets,
+                    session_id=self.session_id,
+                    get_toolset_for_tool=lambda name: toolset_map.get(name),
+                    context_length=ctx_len,
+                    provider=self.provider,
+                    availability=snapshot["availability"],
+                    skills_by_category=snapshot.get("skills_by_category"),
+                )
+
+                def _refresh_banner_snapshot() -> None:
+                    try:
+                        from model_tools import get_toolset_for_tool
+                        tools = get_tool_definitions(
+                            enabled_toolsets=self.enabled_toolsets, quiet_mode=True
+                        )
+                        availability = compute_toolset_availability(self.enabled_toolsets)
+                        tmap = {
+                            t["function"]["name"]: get_toolset_for_tool(t["function"]["name"])
+                            for t in tools
+                        }
+                        for item in availability.get("unavailable_toolsets", []):
+                            for name in item.get("tools", []):
+                                tmap.setdefault(
+                                    name, item.get("id", item.get("name", ""))
+                                )
+                        save_banner_snapshot(
+                            tools, self.enabled_toolsets, availability, tmap
+                        )
+                    except Exception:
+                        logger.debug("banner snapshot refresh failed", exc_info=True)
+
+                threading.Thread(
+                    target=_refresh_banner_snapshot,
+                    name="banner-snapshot-refresh",
+                    daemon=True,
+                ).start()
+            else:
+                # Cold path: compute everything live, then persist the snapshot
+                # so the next launch replays it.
+                from model_tools import get_toolset_for_tool
+                tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+                availability = compute_toolset_availability(self.enabled_toolsets)
+
+                build_welcome_banner(
+                    console=self.console,
+                    model=self.model,
+                    cwd=cwd,
+                    tools=tools,
+                    enabled_toolsets=self.enabled_toolsets,
+                    session_id=self.session_id,
+                    context_length=ctx_len,
+                    provider=self.provider,
+                    availability=availability,
+                )
+                try:
+                    tmap = {
+                        t["function"]["name"]: get_toolset_for_tool(t["function"]["name"])
+                        for t in tools
+                    }
+                    for item in availability.get("unavailable_toolsets", []):
+                        for name in item.get("tools", []):
+                            tmap.setdefault(name, item.get("id", item.get("name", "")))
+                    save_banner_snapshot(tools, self.enabled_toolsets, availability, tmap)
+                except Exception:
+                    logger.debug("banner snapshot save failed", exc_info=True)
         
         # Tool discovery is intentionally deferred on the Termux bare prompt
         # path; availability warnings are shown once tools are initialized.
+        # On the snapshot fast path (warm launch), the check walks every
+        # check_fn (~180ms) — run it in the background refresh thread instead
+        # and let its output land above the prompt (patch_stdout-safe).
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
-            self._show_tool_availability_warnings()
+            if getattr(self, "_defer_tool_warnings", False):
+                threading.Thread(
+                    target=self._show_tool_availability_warnings,
+                    name="tool-availability-warnings",
+                    daemon=True,
+                ).start()
+            else:
+                self._show_tool_availability_warnings()
 
         # Warn about low context lengths (common with local servers). Keep
         # this tied to the runtime guard so guidance cannot drift again.
@@ -7519,6 +7749,179 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         else:
             self._console_print(f"[dim]{_escape(msg)}[/dim]")
 
+    def _persist_model_switch_to_session(self, result) -> None:
+        """Persist a session-scoped /model switch to the session DB row.
+
+        Writes the model column plus the runtime route so ``--resume``
+        (CLI, reads ``gateway_runtime``) and ``session.resume`` (TUI/desktop,
+        reads top-level ``model_config`` keys via
+        ``_stored_session_runtime_overrides``) both restore the switched
+        provider instead of recombining the model with the ambient default
+        (#79536). Mirrors the gateway's ``update_session_model()`` call.
+        getattr: tests drive the switch paths with ``object.__new__`` stubs.
+        """
+        db = getattr(self, "_session_db", None)
+        sid = getattr(self, "session_id", None)
+        if not db or not sid:
+            return
+        provider = result.target_provider
+        # Bare "custom" is the resolved billing class, not a routable
+        # identity — persisting it verbatim makes a later resume hard-fail
+        # when the config default has moved off the custom endpoint
+        # (resolve_runtime_provider only trusts config base_url for bare
+        # custom while the config provider is still custom-ish). Heal to
+        # the durable custom:<name> menu key, else drop the provider —
+        # same recovery the TUI gateway applies on its read path.
+        if str(provider or "").strip().lower() == "custom":
+            try:
+                from hermes_cli.runtime_provider import canonical_custom_identity
+                provider = canonical_custom_identity(
+                    base_url=result.base_url or None,
+                    model=result.new_model or None,
+                ) or None
+            except Exception:
+                provider = None
+        # Both shapes use the same or-None discipline so stale keys from a
+        # previous switch are deleted (not merely omitted) in BOTH the
+        # nested gateway_runtime dict (CLI reader) and the top-level keys
+        # (TUI gateway reader). _merge_model_config_json only deletes on
+        # explicit None, so falsy values must be converted, not filtered.
+        # Deriving the top-level from **route guarantees the two shapes
+        # can never diverge — the asymmetry that caused the original
+        # stale-key bug (#85261 simplify-code review).
+        route = {
+            "provider": provider or None,
+            "base_url": result.base_url or None,
+            "api_mode": result.api_mode or None,
+        }
+        try:
+            db.update_session_model(sid, result.new_model)
+            db.patch_session_model_config(sid, {
+                "gateway_runtime": route,
+                **route,
+            })
+        except Exception:
+            logger.debug(
+                "Failed to persist model switch to session DB", exc_info=True
+            )
+
+    def _restore_session_model(self, session_meta: dict, *, quiet: bool = False) -> None:
+        """Restore model/provider from the session DB row on resume.
+
+        Companion to ``_restore_session_cwd`` / ``_restore_session_yolo`` —
+        called from every resume path (startup ``--resume``/``-c`` and
+        mid-chat ``/resume``). The persisted model lives in the session row's
+        ``model`` column (written at creation time and updated on ``/model``
+        switches via ``update_session_model``); the provider/endpoint live in
+        ``model_config.gateway_runtime`` (written by the gateway's
+        ``_sync_session_model_from_agent`` and the CLI ``/model`` persist).
+        Without this restore a resumed session silently falls back to the
+        config default model, losing the user's last ``/model`` choice.
+
+        When the stored provider differs from the ambient one, credentials
+        are re-resolved for the stored provider (mirroring the gateway's
+        ``_rehydrate_session_model_override``) — the ambient ``self.api_key``
+        belongs to the config-default provider and must not be sent to the
+        session's endpoint. On resolution failure the ambient credentials are
+        kept so the session still opens (the first turn surfaces the auth
+        error instead of the resume dying).
+
+        Skips when the session has no model recorded or when the CLI was
+        launched with an explicit ``-m`` override (user intent wins).
+        """
+        stored_model = (session_meta or {}).get("model")
+        if not stored_model:
+            return
+        # An explicit -m / --model on the command line overrides resume.
+        if getattr(self, "_explicit_model_override", False):
+            return
+        # Stored provider/endpoint via the canonical row-level reader
+        # (prefers model_config.gateway_runtime, falls back to the TUI
+        # gateway's top-level keys).
+        from hermes_state import SessionDB as _SessionDB
+        _stored_runtime = _SessionDB.session_gateway_runtime(session_meta)
+        stored_provider = _stored_runtime.get("provider") or None
+        stored_base_url = _stored_runtime.get("base_url") or None
+        stored_api_mode = _stored_runtime.get("api_mode") or None
+        # Heal bare "custom" persisted by older builds / gateway turns: it's
+        # the resolved billing class, not a routable identity. Recover the
+        # durable custom:<name> menu key from the endpoint, else drop the
+        # provider so resume keeps the ambient default. (Stricter than the
+        # TUI gateway's recovery, which keeps bare "custom" when a base_url
+        # exists — the CLI's resolve path would hard-fail on it, #14676.)
+        if str(stored_provider or "").strip().lower() == "custom":
+            try:
+                from hermes_cli.runtime_provider import canonical_custom_identity
+                stored_provider = canonical_custom_identity(
+                    base_url=stored_base_url or None,
+                    model=stored_model or None,
+                ) or None
+            except Exception:
+                stored_provider = None
+        model_changed = stored_model != self.model
+        provider_changed = bool(stored_provider) and stored_provider != self.provider
+        if not model_changed and not provider_changed:
+            return
+        self.model = stored_model
+        if stored_provider:
+            self.provider = stored_provider
+            self.requested_provider = stored_provider
+            if stored_base_url:
+                self.base_url = stored_base_url
+            if stored_api_mode:
+                self.api_mode = stored_api_mode
+        if provider_changed:
+            # Stale launch-time explicit overrides belong to the AMBIENT
+            # provider; carrying them into the restored provider's
+            # resolution poisons _ensure_runtime_credentials on startup
+            # resume (same leak _apply_model_switch_result guards against
+            # by overwriting _explicit_* on every switch).
+            self._explicit_api_key = None
+            self._explicit_base_url = stored_base_url
+            # Re-resolve credentials for the restored provider. api_key is
+            # never persisted to the session DB (by design) — the normal
+            # runtime provider resolution owns credentials.
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                resolved = resolve_runtime_provider(requested=stored_provider)
+                if resolved.get("api_key"):
+                    self.api_key = resolved["api_key"]
+                    self._credential_pool = resolved.get("credential_pool")
+                if not stored_base_url and resolved.get("base_url"):
+                    self.base_url = resolved["base_url"]
+                if not stored_api_mode and resolved.get("api_mode"):
+                    self.api_mode = resolved["api_mode"]
+            except Exception:
+                logger.debug(
+                    "Credential re-resolution for resumed session provider "
+                    "%s failed; keeping ambient credentials",
+                    stored_provider, exc_info=True,
+                )
+        # If the agent is already running (mid-chat /resume), swap it
+        # in-place so the next turn uses the restored model. On startup
+        # --resume the agent isn't built yet — _init_agent will pick up
+        # self.model / self.provider when constructing AIAgent.
+        if self.agent is not None:
+            try:
+                self.agent.switch_model(
+                    new_model=self.model,
+                    new_provider=self.provider,
+                    api_key=self.api_key or "",
+                    base_url=self.base_url or "",
+                    api_mode=self.api_mode or "",
+                )
+            except Exception:
+                logger.debug(
+                    "In-place agent model swap on resume failed", exc_info=True
+                )
+        msg = f"Model restored from session: {stored_model}"
+        if stored_provider:
+            msg += f" ({stored_provider})"
+        if quiet:
+            print(msg, file=sys.stderr)
+        else:
+            self._console_print(f"[dim]{_escape(msg)}[/dim]")
+
 
 
     def _render_resume_history_panel_lines(self, panel) -> list[str]:
@@ -7632,6 +8035,57 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 f"  {_DIM}Recovered terminal input modes after leaked mouse reports. "
                 f"If this repeats, run /new or restart this tab.{_RST}"
             )
+
+    def _check_termios_drift(self) -> None:
+        """Watchdog: heal the tty if it drifted back to cooked mode.
+
+        See ``_heal_cooked_mode_drift`` for the failure class (a lost
+        ``run_in_terminal`` cooked→raw restore leaves the terminal
+        line-buffering keystrokes while the prompt_toolkit app believes it
+        owns raw mode — the CLI looks dead but the process is healthy).
+
+        Called from ``process_loop``'s idle branch, so a drifted terminal
+        self-heals within ~a second of the agent going idle instead of
+        requiring an external ``stty`` rescue.  Skipped while a
+        ``run_in_terminal`` window is legitimately holding cooked mode
+        (``app._running_in_terminal``), while the agent is running (approval
+        prompts and sudo prompts legitimately manipulate the tty), and on
+        Windows (no termios).
+        """
+        if os.name == "nt":
+            return
+        app = getattr(self, "_app", None)
+        if app is None or not getattr(app, "_is_running", False):
+            return
+        # A run_in_terminal window is *supposed* to be cooked — don't fight it.
+        if getattr(app, "_running_in_terminal", False):
+            return
+        now = time.monotonic()
+        if now - self._last_termios_drift_check < 1.0:
+            return
+        self._last_termios_drift_check = now
+        try:
+            if not sys.stdin.isatty():
+                return
+            fd = sys.stdin.fileno()
+        except Exception:
+            return
+        if _heal_cooked_mode_drift(fd):
+            logger.warning(
+                "Healed cooked-mode termios drift on stdin — a "
+                "run_in_terminal cooked→raw restore was lost."
+            )
+            # Redraw so the prompt is visibly alive again.
+            try:
+                self._invalidate()
+            except Exception:
+                pass
+            if not self._termios_drift_notice_shown:
+                self._termios_drift_notice_shown = True
+                _cprint(
+                    f"  {_DIM}Recovered terminal from cooked-mode drift "
+                    f"(input should respond normally again).{_RST}"
+                )
 
 
 
@@ -8309,6 +8763,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
+        # /new clears the -m / --model override flag: an explicit CLI model
+        # was for the previous session only, not for every session spawned
+        # afterwards.
+        self._explicit_model_override = False
         self.reasoning_config = _parse_reasoning_config(
             CLI_CONFIG["agent"].get("reasoning_effort", "")
         )
@@ -9088,9 +9546,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not getattr(result, "success", False):
             return True
         try:
-            from hermes_cli.model_cost_guard import expensive_model_warning
+            from hermes_cli.model_selection_guards import combined_selection_warning
 
-            warning = expensive_model_warning(
+            warning = combined_selection_warning(
                 result.new_model,
                 provider=result.target_provider,
                 base_url=result.base_url or self.base_url or "",
@@ -9107,7 +9565,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ("cancel", "Cancel", "Keep the current model."),
         ]
         raw = self._prompt_text_input_modal(
-            title="!!! Expensive Model Warning !!!",
+            title=f"!!! {warning.title} !!!",
             detail=warning.message,
             choices=choices,
             timeout=120,
@@ -9387,6 +9845,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         else:
             _cprint("    (session only — add --global to persist)")
 
+        # Persist the switch to this session's row so --resume /
+        # session.resume restore it. --global also updates config.yaml
+        # (future sessions), but the row still records what THIS session
+        # actually runs — otherwise a later resume would restore the stale
+        # creation-time model over the user's new global choice.
+        HermesCLI._persist_model_switch_to_session(self, result)
+
     def _handle_model_picker_selection(self, persist_global: bool = False) -> None:
         state = self._model_picker_state
         if not state:
@@ -9610,6 +10075,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception as exc:
                 logger.debug("preflight-compression switch warning failed: %s", exc)
 
+        # Run the confirm + apply sequence off the main thread. The
+        # expensive-model confirmation modal blocks the calling thread on a
+        # response queue (see _prompt_text_input_modal); running it on the
+        # prompt_toolkit main thread freezes TUI rendering, so the modal never
+        # appears and the switch silently cancels after the 120s timeout.
+        # Mirror the picker path (_handle_model_picker_selection), which
+        # already dispatches confirm+apply on a worker thread.
+        if getattr(self, "_app", None):
+            threading.Thread(
+                target=self._confirm_and_apply_cli_model_switch,
+                args=(result, persist_global, one_turn, custom_provs),
+                daemon=True,
+            ).start()
+            return
+        self._confirm_and_apply_cli_model_switch(
+            result, persist_global, one_turn, custom_provs
+        )
+        return
+
+    def _confirm_and_apply_cli_model_switch(
+        self, result, persist_global: bool, one_turn: bool, custom_provs=None
+    ) -> None:
+        """Confirm an expensive model switch and apply it to CLI state.
+
+        Runs on a worker thread when the TUI is active (see
+        _handle_model_switch) so the confirmation modal can render.
+        """
         if not self._confirm_expensive_model_switch(result):
             _cprint("  Model switch cancelled.")
             return
@@ -9737,6 +10229,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _cprint("    (next turn only — restores after one response)")
         else:
             _cprint("    (session only — add --global to persist)")
+
+        # Persist the switch to this session's row so --resume /
+        # session.resume restore it (--global also updates config.yaml but
+        # the row still records what THIS session runs; --once is ephemeral
+        # and restored after one turn, so it must not touch the row).
+        if not one_turn:
+            HermesCLI._persist_model_switch_to_session(self, result)
 
     def _handle_codex_runtime(self, cmd_original: str) -> None:
         """Handle /codex-runtime — toggle the codex app-server runtime opt-in.
@@ -10005,6 +10504,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _base_word = cmd_lower.split()[0].lstrip("/")
         _cmd_def = _resolve_cmd(_base_word)
         canonical = _cmd_def.name if _cmd_def else _base_word
+
+        # pre_command observer hook (#64204): fires for every recognized
+        # slash command BEFORE its handler runs. Observer-only in v1 —
+        # return values are ignored (fire_pre_command_hook logs directives
+        # at debug). Never raises, so a broken plugin can't break dispatch.
+        if _cmd_def is not None:
+            from hermes_cli.plugins import fire_pre_command_hook
+            _rest_parts = cmd_original.split(None, 1)
+            fire_pre_command_hook(
+                surface="cli",
+                command=canonical,
+                alias_used=_base_word,
+                args_raw=_rest_parts[1].strip() if len(_rest_parts) > 1 else "",
+                session_key=getattr(self, "session_id", None),
+                platform="cli",
+            )
 
         # A bare `/resume` prompt is one-shot: any command other than the
         # resume/sessions handlers (which manage the pending state themselves)
@@ -15146,6 +15661,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Surface any active supply-chain security advisories right after the
         # welcome banner. Quiet/single-query paths call this themselves.
         self._show_security_advisories()
+        # Surface a silent browser-backend downgrade (default Browser Use
+        # mode with no runnable CLI) — one line, rate-limited to 24h.
+        self._show_browser_backend_notice()
 
         # First-run: a completely unconfigured install must route into
         # provider onboarding, not a chat that cannot work. Previously a
@@ -15294,8 +15812,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             maybe_pull_org_skills()
         except Exception:
             pass
-        if self.preloaded_skills and not self._startup_skills_line_shown:
-            skills_label = ", ".join(self.preloaded_skills)
+        _skills_for_line = self.preloaded_skills or list(
+            getattr(self, "_preload_skills_requested", []) or []
+        )
+        if _skills_for_line and not self._startup_skills_line_shown:
+            # When the background --skills preload hasn't been folded in yet
+            # (it joins at agent init), show the REQUESTED names — identical
+            # to the loaded set except for typo'd names, which warn later.
+            skills_label = ", ".join(_skills_for_line)
             self._console_print(
                 f"[bold {_accent_hex()}]Activated skills:[/] {skills_label}"
             )
@@ -17528,6 +18052,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # Periodic config watcher — auto-reload MCP on mcp_servers change
                         if not self._agent_running:
                             self._check_config_mcp_changes()
+                            # Heal cooked-mode termios drift (lost
+                            # run_in_terminal restore) before draining
+                            # notifications — a drifted tty makes the CLI
+                            # look dead even though the loop is healthy.
+                            try:
+                                self._check_termios_drift()
+                            except Exception:
+                                pass
                             # Check for background process notifications (completions
                             # and watch pattern matches) while agent is idle.
                             try:
@@ -18093,6 +18625,13 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
         return
+    worker_run_id = None
+    raw_run_id = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if raw_run_id:
+        try:
+            worker_run_id = int(raw_run_id)
+        except ValueError:
+            logger.warning("invalid HERMES_KANBAN_RUN_ID=%r", raw_run_id)
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
@@ -18138,8 +18677,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     def _task_status() -> "str | None":
         c = _kb.connect()
         try:
-            t = _kb.get_task(c, task_id)
-            return t.status if t is not None else None
+            return _kb.goal_run_status(c, task_id, worker_run_id)
         finally:
             try:
                 c.close()
@@ -18149,7 +18687,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     def _block(reason: str) -> None:
         c = _kb.connect()
         try:
-            _kb.block_task(c, task_id, reason=reason)
+            _kb.block_task(
+                c,
+                task_id,
+                reason=reason,
+                expected_run_id=worker_run_id,
+            )
         finally:
             try:
                 c.close()
@@ -18259,25 +18802,69 @@ def main(
         use_worktree = worktree or w or CLI_CONFIG.get("worktree", False)
         wt_info = None
         if use_worktree:
-            # Prune stale worktrees from crashed/killed sessions
-            _repo = _git_repo_root()
-            if _repo:
-                _prune_stale_worktrees(_repo)
-            # Branch the worktree from the freshly-fetched remote tip by
-            # default so it starts current with the project. Opt out with
-            # worktree_sync: false to branch from local HEAD instead.
+            # Overlap tool discovery with the network/subprocess-bound
+            # worktree setup (base fetch + parallel `git worktree add`
+            # release the GIL for most of their wall time). show_banner()
+            # then hits the warm cache instead of paying ~0.4s serially.
+            # Only done on the -w path: on plain `hermes` there is no I/O
+            # wait to hide and the extra thread just contends for CPU.
+            def _prewarm_tools() -> None:
+                try:
+                    import model_tools as _mt
+                    _mt.get_tool_definitions(quiet_mode=True)
+                except Exception:
+                    logger.debug("tool prewarm failed", exc_info=True)
+
+            threading.Thread(
+                target=_prewarm_tools, name="tool-prewarm", daemon=True
+            ).start()
+            # Worktree creation itself (~0.2-0.6s of git subprocess wall
+            # time) runs concurrently with the rest of startup; join right
+            # after HermesCLI construction, before anything consumes
+            # TERMINAL_CWD / wt_info. Failure semantics preserved: setup
+            # failure still aborts the session (checked at join).
             _sync_base = CLI_CONFIG.get("worktree_sync", True)
-            wt_info = _setup_worktree(sync_base=_sync_base)
-            if wt_info:
-                _active_worktree = wt_info
-                os.environ["TERMINAL_CWD"] = wt_info["path"]
-                atexit.register(_cleanup_worktree, wt_info)
-            else:
-                # Worktree was explicitly requested but setup failed —
-                # don't silently run without isolation.
-                return
+            _wt_result: dict = {}
+
+            def _create_worktree() -> None:
+                try:
+                    _wt_result["info"] = _setup_worktree(sync_base=_sync_base)
+                except Exception:
+                    logger.debug("worktree setup failed", exc_info=True)
+                    _wt_result["info"] = None
+
+            _wt_thread = threading.Thread(
+                target=_create_worktree, name="worktree-setup", daemon=True
+            )
+            _wt_thread.start()
+
+            def _join_worktree() -> Optional[Dict[str, str]]:
+                _wt_thread.join(timeout=120)
+                info = _wt_result.get("info")
+                if info:
+                    global _active_worktree
+                    _active_worktree = info
+                    os.environ["TERMINAL_CWD"] = info["path"]
+                    atexit.register(_cleanup_worktree, info)
+                    # Prune stale worktrees from crashed/killed sessions in
+                    # the background — pure GC, nothing downstream depends
+                    # on it. Ordered AFTER _setup_worktree so the two never
+                    # race on git's worktrees metadata; the new tree itself
+                    # is immune to reaping (<24h age gate + live pid lock).
+                    _repo = _git_repo_root()
+                    if _repo:
+                        threading.Thread(
+                            target=_prune_stale_worktrees,
+                            args=(_repo,),
+                            name="worktree-prune",
+                            daemon=True,
+                        ).start()
+                return info
+        else:
+            _join_worktree = None
     else:
-        wt_info = None
+        _join_worktree = None
+    wt_info = None
     
     # Handle query shorthand
     query = query or q
@@ -18333,32 +18920,37 @@ def main(
     )
 
     if parsed_skills:
-        skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
-            parsed_skills,
-            task_id=cli.session_id,
-        )
-        if missing_skills:
-            missing_display = ", ".join(missing_skills)
-            # If at least one skill loaded, degrade gracefully: skip the
-            # unknown ones and continue. A typo'd skill name should not crash
-            # the worker (which auto-blocks the Kanban task after retries).
-            # Only when EVERY requested skill is missing do we hard-fail, so a
-            # fully-misconfigured worker fails loudly instead of running blind.
-            if loaded_skills:
-                logger.warning(
-                    "Unknown skill(s) requested, skipping: %s. "
-                    "Continuing with: %s. "
-                    "List available skills with `hermes skills list`.",
-                    missing_display,
-                    ", ".join(loaded_skills),
+        # Load the skill payloads in the background: skill_view walks the
+        # full skills tree per skill (~0.5s for a large library) and the
+        # result is only consumed at agent init (first message / first
+        # agent-touching command), not by the banner. cmd_chat joins the
+        # thread via cli.finalize_preloaded_skills() before any consumer
+        # reads cli.system_prompt — HermesCLI._create_agent calls it too,
+        # so no agent can be built with the skills missing.
+        def _load_preloaded_skills() -> None:
+            try:
+                cli._preload_skills_result = build_preloaded_skills_prompt(
+                    parsed_skills,
+                    task_id=cli.session_id,
                 )
-            else:
-                raise ValueError(f"Unknown skill(s): {missing_display}")
-        if skills_prompt:
-            cli.system_prompt = "\n\n".join(
-                part for part in (cli.system_prompt, skills_prompt) if part
-            ).strip()
-            cli.preloaded_skills = loaded_skills
+            except Exception as exc:  # surfaced by finalize below
+                cli._preload_skills_error = exc
+
+        cli._preload_skills_requested = parsed_skills
+        cli._preload_skills_thread = threading.Thread(
+            target=_load_preloaded_skills, name="skills-preload", daemon=True
+        )
+        cli._preload_skills_thread.start()
+
+    # Join the background worktree creation (started above) before anything
+    # consumes TERMINAL_CWD / wt_info — the HermesCLI construction it
+    # overlapped with is done. Setup failure keeps the old abort semantics.
+    if _join_worktree is not None:
+        wt_info = _join_worktree()
+        if not wt_info:
+            # Worktree was explicitly requested but setup failed —
+            # don't silently run without isolation.
+            return
 
     # Inject worktree context into agent's system prompt
     if wt_info:
